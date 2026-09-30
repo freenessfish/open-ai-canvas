@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-: "${IMAGE:?}" "${GITHUB_SHA:?}" "${GITHUB_REF:?}" "${DIGEST_DIR:?}" "${EXPECTED_DIGESTS:?}"
-[[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "Invalid commit SHA" >&2; exit 1; }
+: "${IMAGE:?}" "${DIGEST_DIR:?}" "${EXPECTED_DIGESTS:?}"
+source_commit=${SOURCE_COMMIT:-${GITHUB_SHA:?}}
+source_ref=${SOURCE_REF:-${GITHUB_REF:?}}
+[[ "$source_commit" =~ ^[0-9a-f]{40}$ ]] || { echo "Invalid commit SHA" >&2; exit 1; }
 shopt -s nullglob
 files=("$DIGEST_DIR"/*)
 [[ ${#files[@]} -eq "$EXPECTED_DIGESTS" ]] || { echo "Incomplete image digest set" >&2; exit 1; }
@@ -13,14 +15,14 @@ for file in "${files[@]}"; do
   sources+=("$IMAGE@sha256:$digest")
 done
 
-tags=(--tag "$IMAGE:sha-$GITHUB_SHA" --tag "$IMAGE:sha-${GITHUB_SHA:0:7}")
-if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+tags=(--tag "$IMAGE:sha-$source_commit" --tag "$IMAGE:sha-${source_commit:0:7}")
+if [[ "$source_ref" == refs/tags/v* ]]; then
   [[ "${VERSION_TAG:?}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?([.-][0-9A-Za-z.-]+)?$ ]] || { echo "Invalid version image tag" >&2; exit 1; }
   tags+=(--tag "$IMAGE:$VERSION_TAG")
-elif [[ "$GITHUB_REF" == refs/heads/main ]]; then
+elif [[ "$source_ref" == refs/heads/main ]]; then
   current_sha=$(gh api "repos/${GITHUB_REPOSITORY:?}/git/ref/heads/main" --jq '.object.sha')
   [[ "$current_sha" =~ ^[0-9a-f]{40}$ ]] || { echo "Invalid main branch SHA" >&2; exit 1; }
-  if [[ "$current_sha" == "$GITHUB_SHA" ]]; then
+  if [[ "$current_sha" == "$source_commit" ]]; then
     tags+=(--tag "$IMAGE:latest")
   else
     echo 'A newer main commit exists; leaving latest unchanged.'

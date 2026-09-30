@@ -7,6 +7,11 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      source_tag:
+        description: Exact release tag to build from when dispatching from a workflow-only branch
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -29,22 +34,29 @@ jobs:
       image_tag: ${{ steps.info.outputs.image_tag }}
       build_time: ${{ steps.info.outputs.build_time }}
       owner: ${{ steps.info.outputs.owner }}
+      source_commit: ${{ steps.info.outputs.source_commit }}
+      source_ref: ${{ steps.info.outputs.source_ref }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.source_tag && format('refs/tags/{0}', github.event.inputs.source_tag) || github.ref }}
       - id: info
         name: Validate release metadata
         env:
           REPOSITORY_OWNER: ${{ github.repository_owner }}
+          SOURCE_REF: ${{ github.event.inputs.source_tag && format('refs/tags/{0}', github.event.inputs.source_tag) || github.ref }}
         shell: bash
         run: |
           version="$(tr -d '\r\n' < VERSION)"
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            [[ "$version" == "$GITHUB_REF_NAME" ]] || { echo "VERSION=$version does not match tag $GITHUB_REF_NAME" >&2; exit 1; }
+          if [[ "$SOURCE_REF" == refs/tags/v* ]]; then
+            source_version="${SOURCE_REF#refs/tags/}"
+            [[ "$version" == "$source_version" ]] || { echo "VERSION=$version does not match source tag $source_version" >&2; exit 1; }
             grep -Fqx "## $version" CHANGELOG.md || { echo "CHANGELOG.md is missing ## $version" >&2; exit 1; }
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "image_tag=${version#v}" >> "$GITHUB_OUTPUT"
-          # 相同提交的 main/tag/重跑使用相同时间，避免人为破坏缓存。
+          echo "source_commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "source_ref=$SOURCE_REF" >> "$GITHUB_OUTPUT"
           echo "build_time=$(git show -s --format=%cI HEAD)" >> "$GITHUB_OUTPUT"
           echo "owner=${REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
 
@@ -80,13 +92,20 @@ jobs:
             runner: ubuntu-24.04-arm
           - image: open-ai-canvas-yingce-agent
             dockerfile: yingce-agent/Dockerfile
-            arch: multi
-            platforms: linux/amd64,linux/arm64
+            arch: amd64
+            platforms: linux/amd64
             runner: ubuntu-24.04
+          - image: open-ai-canvas-yingce-agent
+            dockerfile: yingce-agent/Dockerfile
+            arch: arm64
+            platforms: linux/arm64
+            runner: ubuntu-24.04-arm
     env:
       IMAGE: ghcr.io/${{ needs.prepare.outputs.owner }}/${{ matrix.image }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.source_ref }}
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
@@ -96,13 +115,13 @@ jobs:
       - name: Reuse an existing commit image
         id: existing
         env:
-          IMAGE_REF: ${{ env.IMAGE }}:sha-${{ github.sha }}-${{ matrix.arch }}
+          IMAGE_REF: ${{ env.IMAGE }}:sha-${{ needs.prepare.outputs.source_commit }}-${{ matrix.arch }}
         run: bash .github/scripts/resolve-image.sh "$IMAGE_REF"
       - name: Build and push immutable commit image
         id: build
         # A version tag is a release boundary: rebuild its image even if a SHA tag
         # already exists, so a stale/corrupt SHA tag cannot be promoted as a release.
-        if: startsWith(github.ref, 'refs/tags/v') || steps.existing.outputs.found != 'true'
+        if: startsWith(needs.prepare.outputs.source_ref, 'refs/tags/v') || steps.existing.outputs.found != 'true'
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -111,12 +130,12 @@ jobs:
           push: true
           build-args: |
             BUILD_VERSION=${{ needs.prepare.outputs.version }}
-            BUILD_COMMIT=${{ github.sha }}
+            BUILD_COMMIT=${{ needs.prepare.outputs.source_commit }}
             BUILD_TIME=${{ needs.prepare.outputs.build_time }}
-          tags: ${{ env.IMAGE }}:sha-${{ github.sha }}-${{ matrix.arch }}
+          tags: ${{ env.IMAGE }}:sha-${{ needs.prepare.outputs.source_commit }}-${{ matrix.arch }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.revision=${{ needs.prepare.outputs.source_commit }}
             org.opencontainers.image.version=${{ needs.prepare.outputs.version }}
           cache-from: type=gha,scope=${{ matrix.image }}-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=${{ matrix.image }}-${{ matrix.arch }}
@@ -169,20 +188,24 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           IMAGE: ghcr.io/${{ needs.prepare.outputs.owner }}/${{ matrix.image }}
           VERSION_TAG: ${{ needs.prepare.outputs.image_tag }}
+          SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
+          SOURCE_REF: ${{ needs.prepare.outputs.source_ref }}
           DIGEST_DIR: ${{ runner.temp }}/digests
-          EXPECTED_DIGESTS: ${{ matrix.image == 'open-ai-canvas-backend' && '2' || '1' }}
+          EXPECTED_DIGESTS: ${{ matrix.image == 'open-ai-canvas-backend' && '2' || matrix.image == 'open-ai-canvas-yingce-agent' && '2' || '1' }}
         run: bash .github/scripts/promote-image.sh
 
   release:
     name: Publish release assets
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: publish
+    if: startsWith(needs.prepare.outputs.source_ref, 'refs/tags/v')
+    needs: [prepare, publish]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.source_ref }}
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
@@ -199,9 +222,11 @@ jobs:
           cd ../dist
           sha256sum open-ai-canvas-host-updater-linux-* > SHA256SUMS
       - name: Prepare release notes
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
         shell: bash
         run: |
-          version="$GITHUB_REF_NAME"
+          version="$RELEASE_VERSION"
           awk -v heading="## $version" '
             $0 == heading { found=1; next }
             found && /^## / { exit }
@@ -211,10 +236,12 @@ jobs:
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
         shell: bash
         run: |
+          version="$RELEASE_VERSION"
           prerelease_args=()
-          if [[ "$GITHUB_REF_NAME" == *-* || "$GITHUB_REF_NAME" == *.rc* || "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          if [[ "$version" == *-* || "$version" == *.rc* || "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             prerelease_args+=(--prerelease)
           fi
           assets=(
@@ -223,12 +250,12 @@ jobs:
             dist/SHA256SUMS
             docker-compose.deploy.yml
           )
-          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
+          if gh release view "$version" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$version" "${assets[@]}" --clobber
           else
-            gh release create "$GITHUB_REF_NAME" "${assets[@]}" \
+            gh release create "$version" "${assets[@]}" \
               --verify-tag \
-              --title "$GITHUB_REF_NAME" \
+              --title "$version" \
               --notes-file dist/RELEASE_NOTES.md \
               "${prerelease_args[@]}"
           fi
